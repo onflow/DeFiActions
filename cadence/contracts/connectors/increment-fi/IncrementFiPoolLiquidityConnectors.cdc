@@ -106,15 +106,98 @@ access(all) contract IncrementFiPoolLiquidityConnectors {
 
         /// The estimated amount required to provide a Vault with the desired output balance
         ///
-        /// NOTE: quoteIn operation is not implemented and only supported for UFix64.max
-        /// Where it returns a placeholder quote with UFix64.max inAmount and outAmount
+        /// Note: This function uses binary search to estimate the optimal input amount. It is not guaranteed to converge for
+        ///       all inputs and pool reserves.
+        ///
+        /// @param forDesired: the amount of the output token to receive
+        /// @param reverse: if reverse is false, will estimate the amount of token0 to provide for a desired LP amount
+        ///                 if reverse is true, will estimate the amount of LP tokens to provide for a desired token0 amount
+        ///
+        /// @return a DeFiActions.Quote struct containing the estimated amount required to provide a Vault with the desired output balance
+        ///
         access(all) fun quoteIn(forDesired: UFix64, reverse: Bool): {DeFiActions.Quote} {
-            assert(forDesired == UFix64.max, message: "quoteIn operation not implemented")
+            // Handle zero amount case gracefully
+            if (forDesired == 0.0) {
+                return SwapConnectors.BasicQuote(
+                    inType: reverse ? self.outType() : self.inType(),
+                    outType: reverse ? self.inType() : self.outType(),
+                    inAmount: 0.0,
+                    outAmount: 0.0
+                )
+            }
+
+            let pairPublicRef = self.getPairPublicRef()
+            let tokenReserves = self.getTokenReserves(pairPublicRef: pairPublicRef)
+            let token0Reserve = tokenReserves[0]
+            let token1Reserve = tokenReserves[1]
+            assert(token0Reserve > 0.0 && token1Reserve > 0.0, message: "Pool must have positive reserves")
+
+            let pairInfo = pairPublicRef.getPairInfo()
+            let lpTokenSupply = pairInfo[5] as! UFix64
+            assert(lpTokenSupply > 0.0, message: "Pool must have positive LP token supply")
+
+            // The number of epochs to run the binary search for
+            let estimationEpochs = 200
+
+            // Use binary search to find the optimal input amount
+            // Start with reasonable bounds based on current reserves
+            var minInput = SwapConfig.ufix64NonZeroMin
+            var maxInput = 0.0
+            if (!reverse) {
+                // Top bound to calculate how much token0 we'd need to provide to get the desired LP amount
+                maxInput = forDesired * (token0Reserve > token1Reserve ? token0Reserve : token1Reserve)
+            } else {
+                // Top bound to calculate how much LP tokens we'd need to provide to get the desired token0 amount
+                let lpTokensForToken0 = (forDesired * lpTokenSupply) / token0Reserve
+                maxInput = lpTokensForToken0 * (token0Reserve > token1Reserve ? token0Reserve / token1Reserve : token1Reserve / token0Reserve)
+            }
+
+            // Binary search to find the input amount that produces the desired output
+            var bestResult = 0.0
+            var bestInput = 0.0
+            var bestDiff = 0.0
+            var epoch = 0
+            while (epoch < estimationEpochs) {
+                let midInput = (minInput + maxInput) * 0.5
+
+                // Calculate how much tokens we'd get from this input
+                let result = self.quoteOut(forProvided: midInput, reverse: reverse).outAmount
+
+                // Track the best result we've seen
+                let currentDiff = result <= forDesired ? forDesired - result : UFix64.max
+                if (bestResult == 0.0 || currentDiff < bestDiff) {
+                    bestDiff = currentDiff
+                    bestResult = result
+                    bestInput = midInput
+                }
+
+                if (result > forDesired) {
+                    maxInput = midInput
+                } else if (result < forDesired) {
+                    minInput = midInput
+                } else {
+                    break
+                }
+
+                log("epoch: \(epoch), minInput: \(minInput), maxInput: \(maxInput), midInput: \(midInput), result: \(result), bestResult: \(bestResult), bestInput: \(bestInput), bestDiff: \(bestDiff)")
+
+                // Convergence check
+                if (maxInput - minInput <= SwapConfig.ufix64NonZeroMin) {
+                    break
+                }
+
+                epoch = epoch + 1
+            }
+
+            // Final validation
+            assert(bestInput > 0.0, message: "Failed to calculate valid input amount")
+            assert(bestResult > 0.0, message: "Failed to calculate valid result")
+
             return SwapConnectors.BasicQuote(
-                inType: self.inType(),
-                outType: self.outType(),
-                inAmount: UFix64.max,
-                outAmount: UFix64.max
+                inType: reverse ? self.outType() : self.inType(),
+                outType: reverse ? self.inType() : self.outType(),
+                inAmount: bestInput,
+                outAmount: bestResult
             )
         }
 
@@ -136,7 +219,7 @@ access(all) contract IncrementFiPoolLiquidityConnectors {
                     outAmount: 0.0
                 )
             }
-            
+
             let pairPublicRef = self.getPairPublicRef()
             let token0Key = SwapConfig.SliceTokenTypeIdentifierFromVaultType(vaultTypeIdentifier: self.token0Type.identifier)
             let token1Key = SwapConfig.SliceTokenTypeIdentifierFromVaultType(vaultTypeIdentifier: self.token1Type.identifier)
@@ -171,8 +254,6 @@ access(all) contract IncrementFiPoolLiquidityConnectors {
                 let token1Amount = tokenAmounts[1]
 
                 // Calculate how much token0 you get when swapping token1 back to token0
-                // Note: The impact of removed liquidity on the swap price is not considered here
-                // let swappedToken0Amount = pairPublicRef.getAmountOut(amountIn: token1Amount, tokenInKey: token1Key)
                 let swappedToken0Amount = self.calculateSwapAmount(
                     amountIn: token1Amount,
                     token0Offset: -Fix64(token0Amount),
@@ -487,8 +568,13 @@ access(all) contract IncrementFiPoolLiquidityConnectors {
             var token1Reserve = tokenReserves[1]
 
             // Note: simulate zap swap impact on reserves
-            token0Reserve = UFix64(Fix64(token0Reserve) + token0Offset)
-            token1Reserve = UFix64(Fix64(token1Reserve) + token1Offset)
+            // Handle negative offsets carefully to prevent underflow
+            let token0ReserveWithOffset = Fix64(token0Reserve) + token0Offset
+            let token1ReserveWithOffset = Fix64(token1Reserve) + token1Offset
+
+            // Ensure reserves don't go below minimum values
+            token0Reserve = UFix64(token0ReserveWithOffset > 0.0 ? token0ReserveWithOffset : 0.0)
+            token1Reserve = UFix64(token1ReserveWithOffset > 0.0 ? token1ReserveWithOffset : 0.0)
 
             var swappedToken0Amount = 0.0
             if (self.stableMode) {
